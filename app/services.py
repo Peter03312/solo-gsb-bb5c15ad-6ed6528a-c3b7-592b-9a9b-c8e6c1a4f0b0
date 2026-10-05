@@ -27,6 +27,8 @@ from .models import (
     LossCostAllocation,
     LossCostAllocationAccount,
     LossCostAllocationSplit,
+    LossPeriodClosing,
+    LossPeriodClosingLine,
     ManualAdjudication,
     RateEntry,
     RateVersion,
@@ -1712,63 +1714,31 @@ def _frozen_segments(
     )
 
 
-def account_shift_loss(
-    db: Session, shift_id: int, rate_version_no: int, revision: int | None
+def _form_or_reuse_accounting(
+    db: Session, shift: Shift, rev: ShiftResult, rate_version_no: int
 ) -> tuple[LossAccounting, list[LossAccountingPiece], bool]:
-    """对已结算班次按 (修订, 费率版本) 核算停机损失并幂等固化。
+    """形成或复用 (班次, 修订, 费率版本) 的损失账；不提交事务。
 
-    返回 (账头, 全部切分明细[按 piece_no], 是否幂等命中既有账)。
-    - 班次行 FOR UPDATE：同一班次的并发核算相互串行，同组合只有一次写入；
-    - 费率版本行 FOR UPDATE：只可能锁定一个已完整提交的版本；版本发布整批
-      原子、历史版本不可变，锁不阻塞新版本发布，但保证本次核算全程引用
-      同一完整版本，不会读到发布中的半成品；
-    - 修订无固化明细（结构引入前的历史修订）明确拒绝，绝不以当前状态推算；
-    - 账与明细同事务写入；历史账不可改写，后续发布/更正只产生新组合的账。
+    调用方须已持有班次行锁（锁顺序恒为 班次行 → 费率版本行，与
+    account_shift_loss 及期间结账一致）。返回 (账头, 明细[按 piece_no],
+    是否复用既有账)。
     """
-    shift = db.execute(
-        select(Shift).where(Shift.id == shift_id).with_for_update()
-    ).scalar_one_or_none()
-    if shift is None:
-        raise ApiError(404, "SHIFT_NOT_FOUND", f"unknown shift id={shift_id}")
-
-    latest = _latest_revision(db, shift_id)
-    if latest is None:
-        raise ApiError(
-            404, "RESULT_NOT_FOUND", f"shift id={shift_id} has not been settled"
-        )
-    if revision is None:
-        rev = latest
-    else:
-        rev = db.execute(
-            select(ShiftResult).where(
-                ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
-            )
-        ).scalar_one_or_none()
-        if rev is None:
-            raise ApiError(
-                404,
-                "REVISION_NOT_FOUND",
-                f"shift id={shift_id} has no revision {revision}",
-            )
-
     # 幂等：同 (班次, 修订, 费率版本) 只固化一次，历史账原样返回不可改写
     existing = db.execute(
         select(LossAccounting).where(
-            LossAccounting.shift_id == shift_id,
+            LossAccounting.shift_id == shift.id,
             LossAccounting.revision == rev.revision,
             LossAccounting.rate_version == rate_version_no,
         )
     ).scalar_one_or_none()
     if existing is not None:
-        pieces = _accounting_pieces(db, existing.id)
-        db.commit()  # 释放班次行锁
-        return existing, pieces, True
+        return existing, _accounting_pieces(db, existing.id), True
 
     if not rev.segments_available:
         raise ApiError(
             422,
             "SEGMENTS_UNAVAILABLE",
-            f"shift id={shift_id} revision {rev.revision} has no frozen result "
+            f"shift id={shift.id} revision {rev.revision} has no frozen result "
             "segments (a historical revision from before segments were recorded); "
             "loss accounting is refused and current state is never substituted",
         )
@@ -1810,7 +1780,7 @@ def account_shift_loss(
         )
         for r in rate_rows
     ]
-    seg_rows = _frozen_segments(db, shift_id, rev)
+    seg_rows = _frozen_segments(db, shift.id, rev)
     frozen = [
         pricing.FrozenSegment(
             seg_no=s.seg_no, start=s.start_ts, end=s.end_ts, reason=s.reason
@@ -1820,7 +1790,7 @@ def account_shift_loss(
     result = pricing.price_segments(frozen, lines)
 
     accounting = LossAccounting(
-        shift_id=shift_id,
+        shift_id=shift.id,
         device_id=shift.device_id,
         revision=rev.revision,
         rate_version=rate_version_no,
@@ -1879,7 +1849,53 @@ def account_shift_loss(
             )
     for piece in pieces:
         db.add(piece)
+    db.flush()
+    return accounting, pieces, False
+
+
+def account_shift_loss(
+    db: Session, shift_id: int, rate_version_no: int, revision: int | None
+) -> tuple[LossAccounting, list[LossAccountingPiece], bool]:
+    """对已结算班次按 (修订, 费率版本) 核算停机损失并幂等固化。
+
+    返回 (账头, 全部切分明细[按 piece_no], 是否幂等命中既有账)。
+    - 班次行 FOR UPDATE：同一班次的并发核算相互串行，同组合只有一次写入；
+    - 费率版本行 FOR UPDATE：只可能锁定一个已完整提交的版本；版本发布整批
+      原子、历史版本不可变，锁不阻塞新版本发布，但保证本次核算全程引用
+      同一完整版本，不会读到发布中的半成品；
+    - 修订无固化明细（结构引入前的历史修订）明确拒绝，绝不以当前状态推算；
+    - 账与明细同事务写入；历史账不可改写，后续发布/更正只产生新组合的账。
+    """
+    shift = db.execute(
+        select(Shift).where(Shift.id == shift_id).with_for_update()
+    ).scalar_one_or_none()
+    if shift is None:
+        raise ApiError(404, "SHIFT_NOT_FOUND", f"unknown shift id={shift_id}")
+
+    latest = _latest_revision(db, shift_id)
+    if latest is None:
+        raise ApiError(
+            404, "RESULT_NOT_FOUND", f"shift id={shift_id} has not been settled"
+        )
+    if revision is None:
+        rev = latest
+    else:
+        rev = db.execute(
+            select(ShiftResult).where(
+                ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
+            )
+        ).scalar_one_or_none()
+        if rev is None:
+            raise ApiError(
+                404,
+                "REVISION_NOT_FOUND",
+                f"shift id={shift_id} has no revision {revision}",
+            )
+
     try:
+        accounting, pieces, reused = _form_or_reuse_accounting(
+            db, shift, rev, rate_version_no
+        )
         db.commit()
     except IntegrityError:  # 并发同组合核算：唯一约束保证只有一个固化账
         db.rollback()
@@ -1892,7 +1908,7 @@ def account_shift_loss(
         ).scalar_one()
         return winner, _accounting_pieces(db, winner.id), True
     db.refresh(accounting)
-    return accounting, pieces, False
+    return accounting, pieces, reused
 
 
 def _accounting_pieces(db: Session, accounting_id: int) -> list[LossAccountingPiece]:
@@ -2239,3 +2255,249 @@ def list_device_loss_cost_allocations(
         .all()
     )
     return [(h, _allocation_account_rows(db, h.id)) for h in heads]
+
+
+# ------------------------------------------------ 停机损失期间结账（按设备）
+
+
+def _closing_content_hash(
+    device_id: str, start: datetime, end: datetime, seq: int, rate_version: int
+) -> str:
+    """规范化结账输入 → sha256（期间端点归一 UTC；closing_no 为键不参与哈希）。"""
+    payload = {
+        "device_id": device_id,
+        "start": _utc(start).isoformat(),
+        "end": _utc(end).isoformat(),
+        "seq": seq,
+        "rate_version": rate_version,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _closing_lines(db: Session, closing_id: int) -> list[LossPeriodClosingLine]:
+    return list(
+        db.execute(
+            select(LossPeriodClosingLine)
+            .where(LossPeriodClosingLine.closing_id == closing_id)
+            .order_by(LossPeriodClosingLine.line_no)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def close_device_loss_period(
+    db: Session, device_id: str, payload
+) -> tuple[LossPeriodClosing, list[LossPeriodClosingLine], bool]:
+    """按设备封存一个期间的停机损失结账（全或无，同事务固化）。
+
+    返回 (结账账头, 全部班次行[按 line_no], 是否幂等命中既有结账)。
+    - 只纳入期间内起始（班次 start_ts ∈ [start, end)）且截至 seq 已有结算
+      修订的班次，每班取序号 <= seq 的最后修订；无符合班次时固化空结账；
+    - 每班按现有逐段计价/待定价规则形成或复用 (班次, 修订, 费率版本) 损失账；
+      任一所选修订缺少固化明细 → 整单失败（同事务回滚，不留部分新账或结账）；
+    - 同单号同输入重试返回原结账；同单号异输入 409 CLOSING_CONFLICT；
+    - 序号越界 422 INVALID_SEQ、未知设备 404、未知费率版本 404 明确拒绝；
+    - 结账只引用不可变数据（历史修订、固化明细、费率版本、损失账），
+      后续事件更正、费率发布和重新核算都不改变历史结账。
+    """
+    get_device_or_404(db, device_id)
+    start, end = _utc(payload.start), _utc(payload.end)
+
+    max_committed_seq = _current_max_seq(db)
+    if payload.seq > max_committed_seq:
+        raise ApiError(
+            422,
+            "INVALID_SEQ",
+            f"closing seq {payload.seq} is beyond the latest committed change "
+            f"seq {max_committed_seq}; specify a seq no greater than "
+            f"{max_committed_seq} (0 allowed)",
+        )
+
+    # 费率版本必须为该设备已发布版本（存在性校验；形成账时在班次行锁后再加
+    # 版本行锁，锁顺序与单班核算一致）
+    rv_exists = db.execute(
+        select(RateVersion.id).where(
+            RateVersion.device_id == device_id,
+            RateVersion.version == payload.rate_version,
+        )
+    ).scalar_one_or_none()
+    if rv_exists is None:
+        raise ApiError(
+            404,
+            "RATE_VERSION_NOT_FOUND",
+            f"device {device_id!r} has no rate version {payload.rate_version}",
+        )
+
+    content_hash = _closing_content_hash(
+        device_id, start, end, payload.seq, payload.rate_version
+    )
+
+    # 单号行锁：同单号的并发提交串行；先查既有单（同输入幂等 / 异输入冲突）
+    existing = db.execute(
+        select(LossPeriodClosing)
+        .where(LossPeriodClosing.closing_no == payload.closing_no)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.content_hash != content_hash:
+            raise ApiError(
+                409,
+                "CLOSING_CONFLICT",
+                f"closing_no {payload.closing_no!r} already exists with "
+                "different input",
+            )
+        lines = _closing_lines(db, existing.id)
+        db.commit()  # 释放单号行锁
+        return existing, lines, True
+
+    # 期间内起始的班次（按 id 升序加行锁：与单班核算、更正重算及裁定写入
+    # 相互串行，固定顺序避免并发结账相互死锁）
+    shifts = list(
+        db.execute(
+            select(Shift)
+            .where(
+                Shift.device_id == device_id,
+                Shift.start_ts >= start,
+                Shift.start_ts < end,
+            )
+            .order_by(Shift.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+
+    # 每班取序号 <= seq 的最后修订；截至该序号未结算的班次不纳入；
+    # 任一所选修订缺固化明细 → 整单失败（不加区分地拒绝，绝不以当前状态推算）
+    selected: list[tuple[Shift, ShiftResult]] = []
+    for shift in shifts:
+        rev = db.execute(
+            select(ShiftResult)
+            .where(
+                ShiftResult.shift_id == shift.id,
+                ShiftResult.seq <= payload.seq,
+            )
+            .order_by(ShiftResult.revision.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if rev is None:
+            continue
+        if not rev.segments_available:
+            raise ApiError(
+                422,
+                "SEGMENTS_UNAVAILABLE",
+                f"shift id={shift.id} revision {rev.revision} (selected at "
+                f"seq={payload.seq}) has no frozen result segments; the "
+                "historical ruling state cannot be reliably reconstructed, "
+                "so the whole closing is refused (current state is never "
+                "substituted)",
+            )
+        selected.append((shift, rev))
+
+    # 逐班形成或复用损失账（同事务；任一失败整体回滚，不留部分新账）
+    formed: list[tuple[Shift, ShiftResult, LossAccounting]] = []
+    for shift, rev in selected:
+        accounting, _pieces, _reused = _form_or_reuse_accounting(
+            db, shift, rev, payload.rate_version
+        )
+        formed.append((shift, rev, accounting))
+
+    # 汇总并固化账头与全部班次行（同事务写入，之后只读）
+    by_reason = {
+        reason: {"priced_minutes": 0, "amount_cents": 0, "unpriced_minutes": 0}
+        for reason in attribution.REASONS
+    }
+    for _, _, acc in formed:
+        for reason, item in (acc.by_reason or {}).items():
+            bucket = by_reason[reason]
+            bucket["priced_minutes"] += item["priced_minutes"]
+            bucket["amount_cents"] += item["amount_cents"]
+            bucket["unpriced_minutes"] += item["unpriced_minutes"]
+
+    head = LossPeriodClosing(
+        closing_no=payload.closing_no,
+        device_id=device_id,
+        start_ts=start,
+        end_ts=end,
+        seq=payload.seq,
+        rate_version=payload.rate_version,
+        content_hash=content_hash,
+        shift_count=len(formed),
+        total_cents=sum(acc.total_cents for _, _, acc in formed),
+        priced_minutes=sum(acc.priced_minutes for _, _, acc in formed),
+        unpriced_minutes=sum(acc.unpriced_minutes for _, _, acc in formed),
+        by_reason=by_reason,
+    )
+    lines: list[LossPeriodClosingLine] = []
+    try:
+        db.add(head)
+        db.flush()  # 取得 head.id；单号唯一约束兜底并发同单号提交
+        for line_no, (shift, rev, acc) in enumerate(formed, start=1):
+            line = LossPeriodClosingLine(
+                closing_id=head.id,
+                line_no=line_no,
+                shift_id=shift.id,
+                revision=rev.revision,
+                accounting_id=acc.id,
+                total_cents=acc.total_cents,
+                priced_minutes=acc.priced_minutes,
+                unpriced_minutes=acc.unpriced_minutes,
+                by_reason=acc.by_reason,
+            )
+            db.add(line)
+            lines.append(line)
+        db.commit()
+    except IntegrityError:
+        # 并发同单号提交：唯一约束保证只有一单；竞争方转幂等判定
+        db.rollback()
+        winner = db.execute(
+            select(LossPeriodClosing).where(
+                LossPeriodClosing.closing_no == payload.closing_no
+            )
+        ).scalar_one()
+        if winner.content_hash != content_hash:
+            raise ApiError(
+                409,
+                "CLOSING_CONFLICT",
+                f"closing_no {payload.closing_no!r} already exists with "
+                "different input",
+            )
+        return winner, _closing_lines(db, winner.id), True
+
+    db.refresh(head)
+    return head, lines, False
+
+
+def get_loss_period_closing(
+    db: Session, closing_no: str
+) -> tuple[LossPeriodClosing, list[LossPeriodClosingLine]]:
+    """按单号读取固化的期间结账（含全部班次行）；未知单号 404。"""
+    head = db.execute(
+        select(LossPeriodClosing).where(
+            LossPeriodClosing.closing_no == closing_no
+        )
+    ).scalar_one_or_none()
+    if head is None:
+        raise ApiError(
+            404, "CLOSING_NOT_FOUND", f"unknown closing_no: {closing_no!r}"
+        )
+    return head, _closing_lines(db, head.id)
+
+
+def list_device_loss_period_closings(
+    db: Session, device_id: str
+) -> list[tuple[LossPeriodClosing, list[LossPeriodClosingLine]]]:
+    """列出设备的全部固化期间结账（按 id 升序）；未知设备 404。"""
+    get_device_or_404(db, device_id)
+    heads = list(
+        db.execute(
+            select(LossPeriodClosing)
+            .where(LossPeriodClosing.device_id == device_id)
+            .order_by(LossPeriodClosing.id)
+        )
+        .scalars()
+        .all()
+    )
+    return [(h, _closing_lines(db, h.id)) for h in heads]

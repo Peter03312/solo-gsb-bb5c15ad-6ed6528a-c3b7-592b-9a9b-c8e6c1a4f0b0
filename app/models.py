@@ -526,3 +526,101 @@ class LossCostAllocationSplit(Base):
             name="ck_loss_cost_split_priced_shape",
         ),
     )
+
+
+class LossPeriodClosing(Base):
+    """按设备封存一个期间的停机损失结账（账头）。
+
+    - 一次提交面向同一设备：结账单号 closing_no（全局唯一）+ 带时区整分钟
+      半开期间 [start_ts, end_ts) + 截止变更序号 seq + 该设备已发布的费率版本；
+    - 纳入期间内起始（班次 start_ts 落在期间内）且截至 seq 已有结算修订的
+      班次，每班取序号 <= seq 的最后修订，按现有逐段计价/待定价规则形成或
+      复用 (班次, 修订, 费率版本) 损失账；无符合班次时固化空结账；
+    - content_hash 为规范化输入哈希（设备、期间端点归一 UTC、截止序号、
+      费率版本）：同单号同输入重试幂等返回原结账，同单号异输入冲突；
+    - 账头与全部班次行同一事务写入，之后只读不重写——后续事件更正、费率
+      发布或重新核算都不改变历史结账。
+    """
+
+    __tablename__ = "loss_period_closings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    closing_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    # 结账期间（半开 [start_ts, end_ts)，UTC 存储）
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 截止变更序号：只纳入序号 <= seq 的结算修订
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    rate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 规范化输入哈希（同输入判定）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    shift_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 合计金额（分）= 各班次行金额之和；待定价分钟不计入
+    total_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    priced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    unpriced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 按原因汇总：{"maintenance": {"priced_minutes", "amount_cents",
+    #                              "unpriced_minutes"}, ...}
+    by_reason: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["device_id", "rate_version"],
+            ["rate_versions.device_id", "rate_versions.version"],
+            name="fk_closing_rate_version",
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_closing_valid_range"),
+        CheckConstraint("seq >= 0", name="ck_closing_seq_non_negative"),
+        CheckConstraint(
+            "shift_count >= 0 AND total_cents >= 0 AND priced_minutes >= 0 "
+            "AND unpriced_minutes >= 0",
+            name="ck_closing_totals_non_negative",
+        ),
+    )
+
+
+class LossPeriodClosingLine(Base):
+    """结账内一个班次的行：所选修订、账引用及该班按原因汇总（与账头同事务固化）。
+
+    每班一行（line_no 按 shift_id 升序从 1 开始）；accounting_id 指向本次
+    形成或复用的 (班次, 修订, 费率版本) 损失账，汇总列冗余自该账（账本身
+    不可变），之后只读不改。
+    """
+
+    __tablename__ = "loss_period_closing_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    closing_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_period_closings.id"), nullable=False, index=True
+    )
+    # 行内序号（按 shift_id 升序，从 1 开始）
+    line_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    shift_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    accounting_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_accountings.id"), nullable=False
+    )
+    total_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    priced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    unpriced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    by_reason: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["shift_id", "revision"],
+            ["shift_results.shift_id", "shift_results.revision"],
+            name="fk_closing_line_result",
+        ),
+        UniqueConstraint("closing_id", "line_no", name="uq_closing_line_no"),
+        UniqueConstraint("closing_id", "shift_id", name="uq_closing_line_shift"),
+        CheckConstraint(
+            "total_cents >= 0 AND priced_minutes >= 0 AND unpriced_minutes >= 0",
+            name="ck_closing_line_non_negative",
+        ),
+    )

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本→停机损失期间结账 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -273,3 +273,27 @@ req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocatio
   {"batch_no":"B2","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00"}]}'
 req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-BAD3","accounting_ids":[999],"batches":[
   {"batch_no":"B1","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"}]}'
+
+echo "-- 停机损失期间结账：以当前最大变更序号为截止，封存 10/1 全天（班次 1 期间内起始，取该序号前最后修订形成/复用损失账）--"
+CLOSE_SEQ="$(curl -sS "$BASE/changes?cursor=0&limit=500" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')"
+echo "截止变更序号：$CLOSE_SEQ"
+req POST /devices/CNC-01/loss-period-closings "{\"device_id\":\"CNC-01\",\"closing_no\":\"PC-SMOKE-001\",\"start\":\"2026-10-01T00:00:00+08:00\",\"end\":\"2026-10-02T00:00:00+08:00\",\"seq\":$CLOSE_SEQ,\"rate_version\":1}"
+
+echo "-- 同单号同输入重试：预期 200 幂等（idempotent=true，内容与原结账一致）--"
+req POST /devices/CNC-01/loss-period-closings "{\"device_id\":\"CNC-01\",\"closing_no\":\"PC-SMOKE-001\",\"start\":\"2026-10-01T00:00:00+08:00\",\"end\":\"2026-10-02T00:00:00+08:00\",\"seq\":$CLOSE_SEQ,\"rate_version\":1}"
+
+echo "-- 同单号异输入（改费率版本）：预期 409 CLOSING_CONFLICT，原结账不变 --"
+req POST /devices/CNC-01/loss-period-closings "{\"device_id\":\"CNC-01\",\"closing_no\":\"PC-SMOKE-001\",\"start\":\"2026-10-01T00:00:00+08:00\",\"end\":\"2026-10-02T00:00:00+08:00\",\"seq\":$CLOSE_SEQ,\"rate_version\":2}"
+
+echo "-- 无符合班次的期间（11 月无班次）：固化空结账，预期 201 且 shift_count=0 --"
+req POST /devices/CNC-01/loss-period-closings "{\"device_id\":\"CNC-01\",\"closing_no\":\"PC-SMOKE-EMPTY\",\"start\":\"2026-11-01T00:00:00+08:00\",\"end\":\"2026-11-02T00:00:00+08:00\",\"seq\":$CLOSE_SEQ,\"rate_version\":1}"
+
+echo "-- 查询结账：按单号读取（含班次行明细）与按设备列出 --"
+req GET /loss-period-closings/PC-SMOKE-001
+req GET /devices/CNC-01/loss-period-closings
+
+echo "-- 结账错误：序号越界 422 INVALID_SEQ / 未知费率版本 404 / 未知单号 404 / 未知设备 404 --"
+req POST /devices/CNC-01/loss-period-closings "{\"device_id\":\"CNC-01\",\"closing_no\":\"PC-SMOKE-BAD1\",\"start\":\"2026-10-01T00:00:00+08:00\",\"end\":\"2026-10-02T00:00:00+08:00\",\"seq\":999999,\"rate_version\":1}"
+req POST /devices/CNC-01/loss-period-closings "{\"device_id\":\"CNC-01\",\"closing_no\":\"PC-SMOKE-BAD2\",\"start\":\"2026-10-01T00:00:00+08:00\",\"end\":\"2026-10-02T00:00:00+08:00\",\"seq\":1,\"rate_version\":999}"
+req GET /loss-period-closings/NOPE
+req POST /devices/NOPE/loss-period-closings '{"device_id":"NOPE","closing_no":"PC-X","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","seq":0,"rate_version":1}'

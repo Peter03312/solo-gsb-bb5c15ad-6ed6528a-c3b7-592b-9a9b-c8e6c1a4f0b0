@@ -641,3 +641,55 @@ class LossCostAllocationOut(BaseModel):
 
 
 AllocationAccountResult.model_rebuild()
+
+
+# ------------------------------------------------ 停机损失期间结账（按设备）
+
+
+class LossPeriodClosingIn(_Interval):
+    """按设备封存一个期间的停机损失结账。
+
+    - 纳入期间 [start, end) 内起始（班次起点落在期间内）且截至变更序号 seq
+      已有结算修订的班次，每班取序号 <= seq 的最后修订；
+    - 任一非法（期间/序号/费率版本）整单拒绝；同单号同输入重试幂等，异输入冲突。
+    """
+
+    device_id: str = Field(min_length=1, max_length=64)
+    closing_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="结账单号（全局唯一；同单号同输入重试幂等，异输入冲突）",
+        examples=["PC-202610-001"],
+    )
+    seq: int = Field(
+        ge=0,
+        description="截止变更序号：每班取序号不超过它的最后结算修订（0 表示尚无结算）",
+    )
+    rate_version: int = Field(ge=1, description="该设备已发布的费率版本号")
+
+
+class LossPeriodClosingLineOut(BaseModel):
+    """结账内一个班次的行：所选修订、账引用及该班按原因汇总。"""
+
+    line_no: int
+    shift_id: int
+    revision: int  # 截至结账序号所选的最后修订号
+    accounting_id: int  # 形成或复用的 (班次, 修订, 费率版本) 损失账 id
+    totals: LossTotal  # 该班账的按原因汇总（与损失账一致）
+
+
+class LossPeriodClosingOut(BaseModel):
+    """一次固化的期间停机损失结账（同单号同输入重试原样返回，历史不可改）。"""
+
+    id: int
+    closing_no: str
+    device_id: str
+    start: datetime  # 结账期间起点（半开 [start, end)，UTC 输出）
+    end: datetime
+    seq: int  # 本次结账使用的截止变更序号
+    rate_version: int
+    idempotent: bool  # True 表示同单号同输入重试，返回原固化结账
+    shift_count: int  # 纳入结账的班次数（无符合班次时为 0 的空结账）
+    totals: LossTotal  # 全部班次行按原因汇总的合计
+    lines: list[LossPeriodClosingLineOut]
+    created_at: datetime
