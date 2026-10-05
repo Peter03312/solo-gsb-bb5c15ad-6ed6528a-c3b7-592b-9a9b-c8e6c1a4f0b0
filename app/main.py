@@ -25,6 +25,9 @@ from .schemas import (
     BatchWindowIn,
     ChangeEntry,
     ChangePage,
+    ClosingItemOut,
+    ClosingReasonTotal,
+    ClosingTotals,
     DeviceCreate,
     DeviceOut,
     EventAccepted,
@@ -39,6 +42,8 @@ from .schemas import (
     LossAccountingOut,
     LossCostAllocationIn,
     LossCostAllocationOut,
+    LossPeriodClosingIn,
+    LossPeriodClosingOut,
     LossReasonTotal,
     LossTotal,
     PricedPieceOut,
@@ -76,7 +81,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -108,7 +113,14 @@ app = FastAPI(
         "与窗口的交集分摊分钟，窗口外归未分配；定价明细整数分按交集占比"
         "先取整再按余数降序补足（同余数批次号升序、未分配最后），待定价只分分钟；"
         "结果固化各账各去向按原因汇总的分钟金额及来源明细，同单号同内容重试幂等、"
-        "异内容冲突，非法输入整单拒绝。"
+        "异内容冲突，非法输入整单拒绝；"
+        "POST /devices/{device_id}/loss-closings 供财务按设备封存一个期间的停机"
+        "损失结账：输入结账单号、设备、带时区整分钟的半开期间、截止变更序号与"
+        "该设备已发布费率版本，只纳入期间内起始且截至该序号已有结算修订的班次，"
+        "按整班次取该序号前最后修订的固化归因段，沿用逐段计价与待定价规则形成或"
+        "复用损失账；整单同事务固化所选修订、账引用及按原因汇总，任一修订缺少"
+        "固化明细则整单失败，无符合班次固化空结账，同单号同输入重试返回原结账、"
+        "异输入冲突，历史结账不随后续更正/费率发布/重新核算改变。"
     ),
     lifespan=lifespan,
 )
@@ -1112,3 +1124,168 @@ def list_device_loss_cost_allocations_route(
     """列出设备的全部固化分摊单（按提交先后；未知设备 404 DEVICE_NOT_FOUND）。"""
     data = services.list_device_loss_cost_allocations(db, device_id)
     return [_loss_cost_allocation_out(head, rows, True) for head, rows in data]
+
+
+# ------------------------------------------------ 按设备期间停机损失结账
+
+
+def _closing_item_out(item, shift, accounting, pieces) -> ClosingItemOut:
+    by_reason = [
+        LossReasonTotal(
+            reason=reason,
+            priced_minutes=row["priced_minutes"],
+            unpriced_minutes=row["unpriced_minutes"],
+            amount=format_cents(row["amount_cents"]),
+            amount_cents=row["amount_cents"],
+        )
+        for reason, row in sorted(item.by_reason.items())
+    ]
+    totals = LossTotal(
+        amount=format_cents(item.total_cents),
+        amount_cents=item.total_cents,
+        priced_minutes=item.priced_minutes,
+        unpriced_minutes=item.unpriced_minutes,
+        by_reason=by_reason,
+    )
+    priced = [
+        PricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+            rate_per_minute=format_micro(p.rate_per_minute),
+            amount=format_cents(p.amount_cents),
+            amount_cents=p.amount_cents,
+        )
+        for p in pieces
+        if p.priced
+    ]
+    unpriced = [
+        UnpricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+        )
+        for p in pieces
+        if not p.priced
+    ]
+    return ClosingItemOut(
+        item_no=item.item_no,
+        shift_id=item.shift_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=item.revision,
+        revision_seq=item.revision_seq,
+        accounting_id=item.accounting_id,
+        rate_version=accounting.rate_version,
+        totals=totals,
+        priced_pieces=priced,
+        unpriced_pieces=unpriced,
+    )
+
+
+def _loss_period_closing_out(head, items, idempotent: bool) -> LossPeriodClosingOut:
+    by_reason = [
+        ClosingReasonTotal(
+            reason=reason,
+            priced_minutes=row["priced_minutes"],
+            unpriced_minutes=row["unpriced_minutes"],
+            amount=format_cents(row["amount_cents"]),
+            amount_cents=row["amount_cents"],
+        )
+        for reason, row in sorted(head.by_reason.items())
+    ]
+    totals = ClosingTotals(
+        amount=format_cents(head.total_cents),
+        amount_cents=head.total_cents,
+        priced_minutes=head.priced_minutes,
+        unpriced_minutes=head.unpriced_minutes,
+        by_reason=by_reason,
+    )
+    return LossPeriodClosingOut(
+        id=head.id,
+        closing_no=head.closing_no,
+        device_id=head.device_id,
+        idempotent=idempotent,
+        start=head.start_ts,
+        end=head.end_ts,
+        seq=head.seq,
+        rate_version=head.rate_version,
+        totals=totals,
+        items=[
+            _closing_item_out(item, shift, accounting, pieces)
+            for item, shift, accounting, pieces in items
+        ],
+        created_at=head.created_at,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/loss-closings",
+    response_model=LossPeriodClosingOut,
+    tags=["loss-closing"],
+)
+def close_device_loss_period_route(
+    device_id: str,
+    payload: LossPeriodClosingIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """财务按设备封存一个期间的停机损失结账（整单同事务，全或无）。
+
+    - 只纳入**期间内起始**（班次 start ∈ [start, end)）且截至 seq 已有结算
+      修订的班次，按整班次取序号 ≤ seq 的最后修订，用该修订**固化的归因段**
+      与指定的**已发布**费率版本，沿用现有逐段计价与待定价规则形成或复用
+      (班次, 修订, 费率版本) 的损失账（已有同组合账则复用，绝不重算改写）；
+    - 整单在**同一事务**固化：各班次所选修订（含修订序号）、账引用及按原因
+      汇总的金额、定价与待定价分钟；任一修订缺少固化明细（结构引入前的历史
+      修订）→ 422 SEGMENTS_UNAVAILABLE 整单失败，不留部分新账或结账记录；
+    - 无符合班次时固化一张**空结账**（items 为空、合计全 0）；
+    - 同单号同输入重试返回原结账（200，idempotent=true），首次 201；
+      同单号异输入（设备/期间/序号/费率版本不同）→ 409 CLOSING_CONFLICT；
+    - 序号越界 422 INVALID_SEQ、未知设备 404 DEVICE_NOT_FOUND、该设备未知
+      费率版本 404 RATE_VERSION_NOT_FOUND、非法期间 422 VALIDATION_ERROR；
+    - 结账固化后，后续事件更正、费率发布与重新核算只产生新修订/新账，
+      **历史结账及其引用永不改变**。
+    """
+    if payload.device_id != device_id:
+        raise services.ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"device_id in body {payload.device_id!r} does not match path {device_id!r}",
+        )
+    head, items, idempotent = services.close_device_loss_period(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return _loss_period_closing_out(head, items, idempotent)
+
+
+@app.get(
+    "/loss-closings/{closing_no}",
+    response_model=LossPeriodClosingOut,
+    tags=["loss-closing"],
+)
+def get_loss_period_closing_route(closing_no: str, db: Session = Depends(get_db)):
+    """按单号读取固化的期间停机损失结账及明细（历史结账不可改写）。
+
+    未知单号 404 CLOSING_NOT_FOUND。
+    """
+    head, items = services.get_loss_period_closing(db, closing_no)
+    return _loss_period_closing_out(head, items, True)
+
+
+@app.get(
+    "/devices/{device_id}/loss-closings",
+    response_model=list[LossPeriodClosingOut],
+    tags=["loss-closing"],
+)
+def list_device_loss_period_closings_route(
+    device_id: str, db: Session = Depends(get_db)
+):
+    """列出设备的全部固化期间停机损失结账（按提交先后；未知设备 404）。"""
+    data = services.list_device_loss_period_closings(db, device_id)
+    return [_loss_period_closing_out(head, items, True) for head, items in data]

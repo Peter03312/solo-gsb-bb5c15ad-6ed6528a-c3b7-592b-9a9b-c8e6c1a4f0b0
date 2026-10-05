@@ -396,6 +396,109 @@ class LossAccountingPiece(Base):
     )
 
 
+class LossPeriodClosing(Base):
+    """按设备封存一个期间的停机损失结账（账头）。
+
+    - 输入：结账单号 closing_no（全局唯一）、设备、带时区整分钟的半开期间
+      [start_ts, end_ts)、截止变更序号 seq 与该设备已发布的费率版本；
+    - 只纳入**期间内起始**（shift.start_ts 落在 [start_ts, end_ts) 内）且
+      截至 seq 已有结算修订的班次，按整班次取该序号前的最后修订，沿用现有
+      逐段计价与待定价规则形成（或复用）对应的损失账；
+    - 整单在同一事务中固化：各班次所选修订、账引用及按原因汇总的金额、定价
+      与待定价分钟；任一修订缺少固化明细则整单失败，不留部分新账或结账记录；
+    - content_hash 为规范化后的输入哈希（时间归一 UTC）：同单号同输入重试
+      返回原结账，同单号异输入冲突拒绝；
+    - 无符合班次时固化一张空结账；结账后任何事件更正、费率发布、重新核算
+      都只产生新修订/新账，历史结账与其引用永不改变（引用的修订、费率版本、
+      损失账本身均不可变）。
+    """
+
+    __tablename__ = "loss_period_closings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    closing_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    # 规范化输入内容哈希（同输入判定）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 截止变更序号（只取 seq <= 该序号的修订；1..当前最大序号）
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    rate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 合计金额（分）；等于全部纳入损失账合计之和，待定价分钟不计入
+    total_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    priced_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unpriced_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 按原因汇总：{"maintenance": {"priced_minutes", "amount_cents",
+    #                              "unpriced_minutes"}, ...}
+    by_reason: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["device_id", "rate_version"],
+            ["rate_versions.device_id", "rate_versions.version"],
+            name="fk_loss_closing_rate_version",
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_loss_closings_valid_range"),
+        CheckConstraint("seq >= 0", name="ck_loss_closings_seq_non_negative"),
+        CheckConstraint(
+            "total_cents >= 0 AND priced_minutes >= 0 AND unpriced_minutes >= 0",
+            name="ck_loss_closings_totals_non_negative",
+        ),
+    )
+
+
+class LossPeriodClosingItem(Base):
+    """结账内单班次条目：该班次在截止序号下所选修订与对应损失账的引用及汇总。
+
+    与账头同事务固化、之后只读：修订（固化归因段）、费率版本与损失账均为
+    不可变历史，故条目的金额/分钟汇总永久成立；后续事件更正、费率发布或
+    重新核算不会改变本条目。
+    """
+
+    __tablename__ = "loss_period_closing_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    closing_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_period_closings.id"), nullable=False, index=True
+    )
+    # 单内条目序号（按班次 id 升序，从 1 开始）
+    item_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    shift_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 所选修订的全局变更序号（均 <= 结账截止序号）
+    revision_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    accounting_id: Mapped[int] = mapped_column(
+        ForeignKey("loss_accountings.id"), nullable=False
+    )
+    total_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    priced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    unpriced_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 按原因汇总（与该损失账头 by_reason 同形态）
+    by_reason: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["shift_id", "revision"],
+            ["shift_results.shift_id", "shift_results.revision"],
+            name="fk_loss_closing_item_result",
+        ),
+        UniqueConstraint("closing_id", "item_no", name="uq_loss_closing_item_no"),
+        UniqueConstraint(
+            "closing_id", "shift_id", name="uq_loss_closing_item_shift"
+        ),
+        CheckConstraint(
+            "total_cents >= 0 AND priced_minutes >= 0 AND unpriced_minutes >= 0",
+            name="ck_loss_closing_item_totals",
+        ),
+    )
+
+
 class LossCostAllocation(Base):
     """按生产批次窗口分摊停机损失账的固化结果（账头）。
 

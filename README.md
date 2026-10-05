@@ -34,6 +34,14 @@
 同余数批次号升序、未分配最后），分毫不差；待定价只分分钟、不产生金额。
 结果固化各账、各去向按原因汇总的分钟/金额及来源明细，后续归因修订或费率发布
 **不改历史分摊**；同单号同内容重试返回原结果（列表顺序无关），异内容冲突。
+财务还可按设备**封存一个期间的停机损失结账**
+（`POST /devices/{id}/loss-closings`）：输入结账单号、设备、带时区整分钟的
+半开期间、截止变更序号与该设备已发布的费率版本；只纳入**期间内起始**且截至
+该序号已有结算修订的班次，按整班次取该序号前最后修订的固化归因段，沿用现有
+逐段计价与待定价规则**形成或复用**对应损失账；整单在同一事务固化所选修订、
+账引用与按原因汇总的金额/定价/待定价分钟，任一修订缺少固化明细则整单失败；
+无符合班次固化空结账，同单号同输入重试返回原结账、异输入冲突，历史结账随后续
+事件更正、费率发布与重新核算**永不改变**。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -225,6 +233,9 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/devices/{device_id}/loss-cost-allocations` | 按生产批次窗口分摊同一设备的已固化损失账并固化（首次 201 / 同单号同内容 200 / 异内容 409；整单校验全或无） |
 | `GET` | `/loss-cost-allocations/{allocation_no}` | 按单号读取固化的按批次停机损失分摊（未知单号 404） |
 | `GET` | `/devices/{device_id}/loss-cost-allocations` | 列出设备的全部固化分摊单 |
+| `POST` | `/devices/{device_id}/loss-closings` | 按设备封存一个期间的停机损失结账（首次 201 / 同单号同输入 200 / 异输入 409；整单全或无） |
+| `GET` | `/loss-closings/{closing_no}` | 按单号读取固化的期间停机损失结账及明细（未知单号 404） |
+| `GET` | `/devices/{device_id}/loss-closings` | 列出设备的全部固化期间结账 |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -258,6 +269,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 422 | `BATCH_WINDOW_INVALID` | 批次窗口非法：批次号重复或窗口互相重叠（半开、相接允许） |
 | 409 | `ALLOCATION_CONFLICT` | 分摊单号已存在但提交内容不同（同单号同内容重试才幂等） |
 | 404 | `ALLOCATION_NOT_FOUND` | 未知分摊单号 |
+| 409 | `CLOSING_CONFLICT` | 结账单号已存在但提交输入不同（设备/期间/截止序号/费率版本；同单号同输入重试才幂等） |
+| 404 | `CLOSING_NOT_FOUND` | 未知结账单号 |
 
 ## 调用示例
 
@@ -1197,6 +1210,157 @@ curl http://localhost:8000/devices/CNC-01/loss-cost-allocations
 版本）；之后的事件更正、裁定、费率发布产生的是**新修订/新费率/新账**，已固化的
 分摊单及其汇总、来源明细原样可读。
 
+## 按设备期间停机损失结账（财务封存）
+
+财务按设备封存一段时间的停机损失：`POST /devices/{device_id}/loss-closings`
+输入结账单号、设备、带时区整分钟的半开期间、截止变更序号与该设备**已发布**的
+费率版本，系统在**同一事务**内选出符合班次、为每个班次形成或复用既有损失账，
+并把整单的所选修订、账引用与按原因汇总一次性固化。历史结账永久只读。
+
+### 请求
+
+`POST /devices/{device_id}/loss-closings` 请求体：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `device_id` | 是 | 必须与路径设备一致 |
+| `closing_no` | 是 | 结账单号（全局唯一）；同单号**同输入**重试幂等返回原结账，**异输入** `409` |
+| `start` / `end` | 是 | 带时区、整分钟的半开封存期间 `[start, end)`，`start < end` |
+| `seq` | 是 | 截止变更序号（`0..当前已提交最大序号`）：只取 `seq ≤` 它的修订；`0` 表示尚无任何结算 |
+| `rate_version` | 是 | 该设备**已发布**的费率版本号（用其他设备的版本号 → 404） |
+
+### 纳入与选取
+
+- 只纳入**期间内起始**的班次：班次起点 `shift.start ∈ [start, end)`（半开，
+  起点恰在 `end` 上的班次**不**纳入，起点恰在 `start` 上的纳入）；班次是否
+  跨出期间终点不影响，按**整班次**取数；
+- 班次还须在截止序号前**已结算**（存在 `seq ≤ seq` 的修订）；未结算班次、
+  期间外起点的班次不纳入；
+- 每个纳入班次取 **`seq ≤` 截止序号的最后修订**（与班次快照、现场对账同一
+  选择规则，历史修订不可变），并用该修订**同事务固化的归因段**与指定费率
+  版本，沿用[损失核算](#停机损失费率与核算按设备递增版本按组合固化)的逐段
+  计价与待定价规则形成或复用损失账：
+  - 同 `(班次, 修订, 费率版本)` 的账**已存在则直接复用**（绝不重新计价或改写），
+    否则在结账事务内新建账与切分明细；
+  - 金额逐段按分四舍五入后求和，未匹配费率的分钟单列待定价、不作零金额。
+
+### 固化与全或无
+
+- 整单在**同一事务**固化：结账头（输入 + 合计）与各班次条目（所选修订号、
+  修订序号 `revision_seq`、损失账 `accounting_id`、该账合计与按原因汇总）；
+  整单合计 = 各纳入损失账合计的机械求和（不二次取整），金额、定价分钟、
+  待定价分钟均**按原因**给出汇总；
+- **任一**选中修订缺少固化归因段（结构引入前的历史修订）→
+  `422 SEGMENTS_UNAVAILABLE`，**整单失败**：回滚后不留任何新损失账、条目或
+  结账记录，绝不以当前状态推算；
+- **无符合班次时固化一张空结账**（`items=[]`、金额/分钟全 0），便于财务
+  对空期间留痕；
+- 结账固化后，后续事件更正、裁定、费率发布或重新核算只产生**新修订/新费率/
+  新账**，已固化结账及其引用原样可读，**历史永不改变**；
+- 并发：同单号提交由单号唯一约束 + 整事务兜底，只有一单固化，竞争方转幂等
+  返回（同输入）或冲突（异输入）。
+
+### 幂等、冲突与错误
+
+- 同单号**同输入**重试返回原结账（`200`，`idempotent=true`），首次 `201`；
+  同单号**异输入**（设备/期间/截止序号/费率版本任一不同，时间按 UTC 归一比较）
+  → `409 CLOSING_CONFLICT`；
+- 截止序号超过当前已提交最大序号 → `422 INVALID_SEQ`（`seq=0` 合法，得空结账）；
+- 未知设备 `404 DEVICE_NOT_FOUND`、该设备未知费率版本（含其他设备的版本号）
+  `404 RATE_VERSION_NOT_FOUND`；
+- 期间缺时区 / 未对齐整分钟 / `start ≥ end`、`seq < 0` → `422 VALIDATION_ERROR`；
+- 读取：`GET /loss-closings/{closing_no}`（未知单号 `404 CLOSING_NOT_FOUND`）、
+  `GET /devices/{device_id}/loss-closings`（按设备列出全部固化结账）。
+
+### 调用示例
+
+设备 `CNC-01`：10/1 早班 08:00–16:00（故障 10:00–12:00，已结算为 seq=1）、
+10/2 早班（保养 09:00–10:00，已结算为 seq=2）；费率版本 1 = 故障 1 元/分、
+保养 2 元/分（全天）。
+
+```bash
+# 封存 10/1–10/3 的停机损失，截止序号 2、费率版本 1
+curl -X POST http://localhost:8000/devices/CNC-01/loss-closings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_id": "CNC-01",
+    "closing_no": "LC-202610-001",
+    "start": "2026-10-01T00:00:00+08:00",
+    "end":   "2026-10-03T00:00:00+08:00",
+    "seq": 2,
+    "rate_version": 1
+  }'
+# 201
+```
+
+```json
+{
+  "id": 1,
+  "closing_no": "LC-202610-001",
+  "device_id": "CNC-01",
+  "idempotent": false,
+  "start": "2026-09-30T16:00:00Z",
+  "end":   "2026-10-02T16:00:00Z",
+  "seq": 2,
+  "rate_version": 1,
+  "totals": {
+    "amount": "240.00", "amount_cents": 24000,
+    "priced_minutes": 180, "unpriced_minutes": 0,
+    "by_reason": [
+      {"reason": "maintenance", "priced_minutes": 60, "unpriced_minutes": 0, "amount": "120.00", "amount_cents": 12000},
+      {"reason": "failure",     "priced_minutes": 120, "unpriced_minutes": 0, "amount": "120.00", "amount_cents": 12000},
+      {"reason": "pending",     "priced_minutes": 0,   "unpriced_minutes": 0, "amount": "0.00",   "amount_cents": 0}
+    ]
+  },
+  "items": [
+    {
+      "item_no": 1, "shift_id": 1,
+      "shift_start": "2026-10-01T00:00:00Z", "shift_end": "2026-10-01T08:00:00Z",
+      "revision": 1, "revision_seq": 1, "accounting_id": 1, "rate_version": 1,
+      "totals": {"amount": "120.00", "amount_cents": 12000, "priced_minutes": 120, "unpriced_minutes": 0, "by_reason": [/* … */]},
+      "priced_pieces": [
+        {"piece_no": 1, "seg_no": 1, "start": "2026-10-01T02:00:00Z", "end": "2026-10-01T04:00:00Z",
+         "minutes": 120, "reason": "failure", "rate_per_minute": "1", "amount": "120.00", "amount_cents": 12000}
+      ],
+      "unpriced_pieces": []
+    }
+    /* item_no=2：10/2 班次，保养 60 分钟 120.00 元，accounting_id 指向其固化/复用账 */
+  ],
+  "created_at": "..."
+}
+```
+
+> 每个条目都回显班次区间、所选修订与其全局序号、复用/新建的损失账 `accounting_id`
+> 及该账的完整切分明细（`priced_pieces` / `unpriced_pieces`），与
+> `GET /shifts/{id}/loss-accountings` 逐字节同形，便于逐笔核对。
+
+```bash
+# 同单号同输入重试 → 200，idempotent=true，返回原结账（账引用也不变）
+curl -X POST http://localhost:8000/devices/CNC-01/loss-closings \
+  -H 'Content-Type: application/json' -d '{ …同上… }'
+
+# 同单号异输入（如改截止序号或期间）→ 409 CLOSING_CONFLICT，原结账不变
+
+# 固化后事件更正产生修订 3、发布费率版本 2，再用新单号/新序号结账 → 新结账只引用新组合；
+# 旧结账 GET /loss-closings/LC-202610-001 原样不变
+
+# 无符合班次（seq=0 尚无结算，或期间内无班次）→ 201 空结账
+curl -X POST http://localhost:8000/devices/CNC-01/loss-closings -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","closing_no":"LC-EMPTY","start":"2026-11-01T00:00:00+08:00",
+       "end":"2026-11-02T00:00:00+08:00","seq":0,"rate_version":1}'
+# → {"items": [], "totals": {"amount":"0.00", "priced_minutes":0, "unpriced_minutes":0, …}}
+
+# 读取与列表
+curl http://localhost:8000/loss-closings/LC-202610-001
+curl http://localhost:8000/devices/CNC-01/loss-closings
+
+# 错误示例
+# 截止序号越界        → 422 INVALID_SEQ
+# 未知费率版本/跨设备 → 404 RATE_VERSION_NOT_FOUND
+# 历史修订无固化明细  → 422 SEGMENTS_UNAVAILABLE（整单不留痕）
+# 期间缺时区/start≥end → 422 VALIDATION_ERROR
+```
+
 ## 设计要点
 
 - **归因算法**（`app/attribution.py`，纯标准库可独立测试）：按原因收集区间并裁剪到班次窗口；
@@ -1293,6 +1457,25 @@ curl http://localhost:8000/devices/CNC-01/loss-cost-allocations
   （非空/批次号唯一/整分钟/互不重叠）；任一非法回滚不留部分结果，单号唯一
   约束兜底并发同单号提交（竞争方转幂等读取）。分摊只引用固化损失账，
   归因修订或费率发布后历史分摊原样不变。
+- **按设备期间停机损失结账**：算法辅助在 `app/closing.py`（纯标准库可独立测试）：
+  把多份已固化损失账的合计与 by_reason **机械求和**（整数分直接相加、不二次
+  取整，并校验账头标量与其按原因明细之和一致），三类原因恒列出，无账时为
+  全 0 空汇总。固化为 `loss_period_closings`（单号唯一 + 规范化内容哈希，
+  时间归一 UTC）+ `loss_period_closing_items`（单内每班次一行：所选修订、
+  修订序号、账外键与按原因汇总）两张只追加表，外键分别指向不可变费率版本、
+  固化修订 `(shift_id, revision)` 与损失账。写路径先锁单号行（同单号并发
+  串行：同输入幂等、异输入冲突），再校验截止序号不越界（复用
+  `_current_max_seq`，越界 `INVALID_SEQ`）与费率版本归属，随后用与班次快照/
+  现场对账**同一套"每组 seq ≤ 截止序号取最大修订号"子查询**、按班次起点
+  半开落期间过滤选班次；先整单校验每个选中修订 `segments_available=TRUE`
+  （任一缺失即 `SEGMENTS_UNAVAILABLE`，此时尚未写入任何行），再按班次 id
+  升序锁班次行，调用与单班次核算共用的 `_get_or_create_accounting`
+  （同 `(班次,修订,费率版本)` 复用既有账，否则在本事务内新建），最后把头、
+  条目、可能新建的账与切分明细**同一事务提交**；flush/commit 的唯一约束
+  冲突统一回滚并转幂等读取或 `CLOSING_CONFLICT`，不留孤儿账或半截结账。
+  结账只引用不可变的修订/费率/损失账，故事后的更正、费率发布与重新核算对
+  历史结账完全免疫；条目冗余的账合计与按原因汇总使读回应答不依赖账被后续
+  新增行影响（账本身本就不可变）。
 
 ## 项目结构
 
@@ -1304,6 +1487,7 @@ app/
   reconciliation.py # 现场-系统对账算法（裁剪/覆盖/差集，纯标准库）
   pricing.py      # 损失核算：定点金额、费率校验、按费率边界切分/逐段取整/待定价（纯标准库）
   allocation.py   # 按批次分摊：窗口交集分钟、整数分最大余数法（同余数批次升序/未分配最后）、待定价只分分钟（纯标准库）
+  closing.py      # 期间结账：多份损失账合计与按原因汇总机械求和（空结账全 0，纯标准库）
   models.py       # SQLAlchemy 模型
   schemas.py      # Pydantic 请求/响应与校验
   db.py           # 引擎、会话、建库建表（含排他约束）
@@ -1322,7 +1506,9 @@ tests/
   test_pricing.py               # 损失核算算法单测（定点金额/费率校验/边界切分/逐段取整/待定价合并，无外部依赖，可 python3 直接跑）
   test_loss_accounting.py       # 费率发布（连续版本/原子拒绝/并发）与损失核算（切分取整/待定价/幂等固化/历史不可改/跨设备/并发唯一）端到端测试（需 PostgreSQL）
   test_allocation.py            # 按批次分摊算法单测（窗口交集/最大余数法决胜/未分配拆段/守恒/待定价/时区，无外部依赖，可 python3 直接跑）
+  test_closing_alg.py           # 期间结账汇总算法单测（多账机械求和/空结账/账头明细一致性校验，无外部依赖，可 python3 直接跑）
   test_loss_cost_allocation.py  # 按批次分摊端到端（整单校验全或无/金额分钟守恒/幂等顺序无关/冲突/跨设备账/同班次多账/历史固化/并发唯一，需 PostgreSQL）
+  test_loss_period_closing.py   # 期间结账端到端（期间内起始选取/截止序号选修订/形成复用账/空结账/幂等冲突/明细缺失整单失败/历史不变/并发唯一，需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```

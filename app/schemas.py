@@ -641,3 +641,95 @@ class LossCostAllocationOut(BaseModel):
 
 
 AllocationAccountResult.model_rebuild()
+
+
+# ------------------------------------------------ 按设备期间停机损失结账
+
+
+class LossPeriodClosingIn(BaseModel):
+    """按设备封存一个期间的停机损失结账。
+
+    - 只纳入期间内起始（班次 start ∈ [start, end)）且截至 seq 已有结算修订的
+      班次，按整班次取该序号前的最后修订，以该设备已发布的指定费率版本沿用
+      现有逐段计价/待定价规则形成或复用损失账；
+    - 任一选中修订缺少固化明细整单失败（不留部分新账或结账记录）；
+    - 无符合班次时固化空结账；同单号同输入重试返回原结账，异输入冲突。
+    """
+
+    device_id: str = Field(min_length=1, max_length=64)
+    closing_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="结账单号（全局唯一；同单号同输入重试幂等，异输入冲突）",
+        examples=["LC-202610-001"],
+    )
+    start: datetime = Field(description="封存期间起点（含），带时区整分钟")
+    end: datetime = Field(description="封存期间终点（不含），带时区整分钟")
+    seq: int = Field(
+        ge=0,
+        description="截止变更序号：只取 seq 不大于该序号的修订；0 表示尚无任何结算",
+    )
+    rate_version: int = Field(ge=1, description="该设备已发布的费率版本号")
+
+    @field_validator("start", "end")
+    @classmethod
+    def _ts(cls, v: datetime) -> datetime:
+        return _check_ts(v)
+
+    @model_validator(mode="after")
+    def _range(self):
+        if not self.start < self.end:
+            raise ValueError("invalid period: start must be earlier than end")
+        return self
+
+
+class ClosingReasonTotal(BaseModel):
+    """结账内单个原因的汇总。"""
+
+    reason: str
+    priced_minutes: int
+    unpriced_minutes: int
+    amount: str  # 金额（元，两位小数字符串）
+    amount_cents: int  # 金额（分，整数）
+
+
+class ClosingTotals(BaseModel):
+    """整单合计：等于全部纳入损失账合计之和；待定价分钟单列、不计金额。"""
+
+    amount: str
+    amount_cents: int
+    priced_minutes: int
+    unpriced_minutes: int
+    by_reason: list[ClosingReasonTotal]
+
+
+class ClosingItemOut(BaseModel):
+    """结账内单班次条目：所选修订、账引用、汇总与账内切分明细。"""
+
+    item_no: int
+    shift_id: int
+    shift_start: datetime  # 班次区间（UTC 输出）
+    shift_end: datetime
+    revision: int
+    revision_seq: int  # 所选修订的全局变更序号（均 <= 结账截止序号）
+    accounting_id: int  # 复用/新形成的损失账 id
+    rate_version: int
+    totals: LossTotal
+    priced_pieces: list[PricedPieceOut]
+    unpriced_pieces: list[UnpricedPieceOut]
+
+
+class LossPeriodClosingOut(BaseModel):
+    """一次固化的按设备期间停机损失结账（历史不可改；同单号同输入重试原样返回）。"""
+
+    id: int
+    closing_no: str
+    device_id: str
+    idempotent: bool  # True 表示同单号同输入重试，返回原固化结账
+    start: datetime
+    end: datetime
+    seq: int  # 截止变更序号
+    rate_version: int
+    totals: ClosingTotals
+    items: list[ClosingItemOut]
+    created_at: datetime
